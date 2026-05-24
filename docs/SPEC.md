@@ -33,34 +33,91 @@ The protocol must satisfy seven properties (matching the `README` design princip
 
 ## 3. Delivery condition (policy)
 
-The `PaymentOffer` gains a `policy` field. Each policy is one or more `checks[]`, each of one of three types:
+The `PaymentOffer` gains a `policy` field carrying the full JSON object below. The on-chain escrow contract stores only `policyHash = keccak256(canonical_json(policy))`; the JSON itself travels off-chain in the offer and is optionally pinned to IPFS for permanence.
+
+```json
+{
+  "version": "1",
+  "checks": [
+    { "type": "url_check",   ... },
+    { "type": "hash_check",  ... },
+    { "type": "event_check", ... }
+  ]
+}
+```
+
+The on-chain footprint is 32 bytes per payment. The off-chain JSON is bounded at 8 KB (see §3.5).
+
+### 3.0 Idiot-proof guardrails (MUST hold for every policy)
+
+A conformant policy-construction library MUST refuse to serialize a policy violating any of these rules. Oracles MUST refuse to attest against a policy that violates any of these rules even if a payer somehow got it on-chain.
+
+| Rule | Reason |
+|---|---|
+| `version` MUST equal `"1"` for this revision. | Forward-compat: oracles dispatch on it. |
+| `checks` MUST be a non-empty array. | A policy that requires nothing trivially passes — useless. |
+| Total serialized JSON MUST be ≤ 8192 bytes. | Bounds the off-chain blob; one IPFS block. |
+| Each check's `type` MUST be one of `"url_check"`, `"hash_check"`, `"event_check"`. | v1 enumerates check types explicitly; future revisions add via version bump. |
+| Each check MUST satisfy its per-type rules (3.1, 3.2, 3.3). | Catches malformed checks at construction, not at attestation. |
 
 ### 3.1 `url_check`
 
 ```json
 {
   "type": "url_check",
-  "url": "https://provider.example/v1/deliver/abc123",
+  "url": "ipfs://bafy.../delivery.json",
   "method": "GET",
   "expect_status": 200,
-  "expect_body_hash": "0x9f...",      // optional
-  "max_latency_ms": 30000
+  "expect_body_hash": "0x4a...",
+  "expect_within_ms": 30000,
+  "expect_signed_receipt": {
+    "signer": "0xAbhi...",
+    "must_contain": ["request_id", "output_hash"]
+  }
 }
 ```
 
-Oracle fetches the URL; passes if status + body hash match.
+Oracle fetches the URL; passes if all of: status matches `expect_status`, response received within `expect_within_ms` milliseconds, body hash matches `expect_body_hash` (when present), and `expect_signed_receipt` validates (when present).
+
+**Per-type guardrails (MUST):**
+
+| Rule | Reason |
+|---|---|
+| `url` MUST be `https://` or `ipfs://`. Plain `http://` MUST be rejected. | TLS is non-negotiable for HTTPS; IPFS is content-addressed. |
+| `url` host MUST NOT be in the denylist: `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, `*.internal`, `*.local`, any RFC-1918 private range. | Prevents an oracle from "checking" its own machine; ensures the URL is publicly auditable. |
+| If `url` scheme is `https://`, `expect_body_hash` MUST be present and non-zero. | Without it the rule is trivially game-able (payee serves any 200). IPFS URIs are exempt because the CID *is* the hash. |
+| `expect_status` MUST be in `{200, 201, 202, 204, 206}`. | Sane success codes. 3xx redirects are out of scope (oracles MUST NOT follow redirects). |
+| `expect_within_ms` MUST be in `[100, 60000]`. | Bounds oracle compute budget. |
+| `method` MUST be `"GET"`. | v1 limits to GET; POST/PUT/DELETE aren't deliverable verification, they're side effects. |
+| If `expect_signed_receipt` is present, `signer` MUST be a non-zero hex address, and `must_contain` MUST be a non-empty array of string field names. | Catches malformed receipt specs at construction. |
+| Oracle implementations MUST NOT follow HTTP redirects. | Eliminates a class of routing-trick attacks. |
+
+**The `expect_signed_receipt` pattern (for non-deterministic deliverables):**
+
+When the deliverable is not known in advance (e.g., LLM inference output), the payee signs a small receipt `{request_id, output_hash, timestamp}` with a key declared in the policy. The URL check fetches the receipt, verifies the signature against `signer`, and confirms it contains the required `must_contain` fields. The actual deliverable lives wherever; the receipt is what's checked.
 
 ### 3.2 `hash_check`
 
 ```json
 {
   "type": "hash_check",
-  "commitment": "0x4a...",            // committed by payee in the offer
-  "artifact_hash_field": "deliverable_hash"   // payee signs this in their delivery message
+  "source_url": "ipfs://bafy.../artifact.bin",
+  "expect_hash": "0x4a...",
+  "hash_algorithm": "keccak256"
 }
 ```
 
-Oracle reads the payee's delivery message (out-of-band — Slack, email, or a known endpoint declared in the offer); verifies the signed `deliverable_hash` matches the commitment.
+Oracle fetches the bytes at `source_url` and computes `hash_algorithm(bytes)`; passes if the result equals `expect_hash`.
+
+**Per-type guardrails (MUST):**
+
+| Rule | Reason |
+|---|---|
+| `source_url` MUST be `https://` or `ipfs://`. | Same TLS / content-address rule as `url_check`. |
+| `source_url` host MUST NOT be in the denylist (same list as 3.1). | Same rationale. |
+| `expect_hash` MUST be a 32-byte hex string (`0x` + 64 hex chars). | Pinning the exact expected hash. |
+| `hash_algorithm` MUST be one of `"keccak256"`, `"sha256"`. | v1 limits to these two; SHA-1 / MD5 etc. are out by construction. |
+| Oracle MUST limit the response body to ≤ 100 MB. | Bounds memory; deliverables larger than 100 MB SHOULD be chunked and use a Merkle root. |
 
 ### 3.3 `event_check`
 
@@ -68,17 +125,51 @@ Oracle reads the payee's delivery message (out-of-band — Slack, email, or a kn
 {
   "type": "event_check",
   "chain_id": 8453,
-  "address": "0x...",
-  "topic0": "0xddf2...",              // event signature
+  "address": "0xContract...",
+  "topic0": "0xddf2...",
+  "topics": ["0xddf2...", null, "0xpayer..."],
   "block_range": [25000000, 25001000]
 }
 ```
 
-Oracle queries an RPC node; passes if the log matches.
+Oracle queries an RPC node on `chain_id` for any log emitted by `address` in `[block_range[0], block_range[1]]` whose topics match `topics` (with `null` meaning wildcard for that topic slot). Passes if at least one matching log is found and the block containing it is finalized.
+
+**Per-type guardrails (MUST):**
+
+| Rule | Reason |
+|---|---|
+| `chain_id` MUST be a positive integer. | EIP-155 chain id. |
+| `address` MUST be a 20-byte hex address. | Standard Solidity address shape. |
+| `topic0` MUST be a 32-byte hex string. Other `topics` MAY be 32-byte hex or `null` (wildcard). | Mirror EVM log structure. |
+| `block_range` MUST be a 2-element array with `block_range[1] - block_range[0] ≤ 50_000`. | Bounds oracle RPC cost. |
+| `block_range[1]` MUST be ≤ (finalized head block at attestation time). | Reorg-safety: oracles MUST NOT attest events from unfinalized blocks. |
+| Oracle MUST query at finality, not at inclusion. | Same rationale; finalization windows are chain-specific (Lux: 1 epoch, Ethereum: 64 blocks, Base: 1024 blocks). |
 
 ### 3.4 Composition
 
-`checks[]` is an array; all must pass for the attestation to be `true`. v2: support `any-of`, `weighted`, threshold.
+`checks[]` is an array; ALL checks MUST pass for the attestation to be `check_result: true`. v2 plans `any-of`, `weighted`, and threshold composition; v1 is strict AND.
+
+If any check fails, the oracle MUST set `check_result: false` and the attestation MAY still be submitted. The aggregator counts only matching attestations (true vs. true, or false vs. false) toward the K-of-N threshold.
+
+### 3.5 Storage and transport
+
+| Where | What |
+|---|---|
+| **On-chain (escrow contract)** | 32 bytes: `policyHash = keccak256(canonical_json(policy))`. Nothing else from the policy lives on-chain. |
+| **Off-chain (PaymentOffer)** | The full `policy` JSON ships in the off-chain `PaymentOffer` carried between payer and payee. |
+| **Off-chain (optional IPFS pin)** | Payer MAY also pin the canonical bytes to IPFS so the policy outlives the payer's hosting. Pin cost is negligible (~$0.0001/GB-month on Filecoin). |
+
+Oracles fetch the policy via the `PaymentOffer` first, fall back to the IPFS CID (when published in the offer's `policy_cid` sibling field) if the offer's primary endpoint is unreachable.
+
+The **canonical JSON encoding** is per [switchboard's payment-protocol convention](https://github.com/kcolbchain/switchboard/blob/main/docs/agent-payment-protocol.md): `json.dumps(d, sort_keys=True, separators=(",", ":"))`. Same encoding everywhere keeps `keccak256` deterministic across implementations.
+
+### 3.6 Validation requirements
+
+| Stage | Who | What MUST happen |
+|---|---|---|
+| Construction (payer-side) | Policy library | Reject any policy violating §3.0 or any per-type guardrail. Compute `policyHash` and pass it to `AgentEscrow.createPaymentWithPolicy`. |
+| Receipt (oracle-side) | Oracle | Re-verify `keccak256(canonical_json(received_policy)) == on_chain_policyHash`. Re-validate every guardrail. Refuse to attest if any check fails to validate. |
+| Settlement (contract-side) | `AgentEscrow` + `IOracleAggregator` | The contract trusts `policyHash` as opaque. The aggregator MAY check the policy structure if it has the JSON; v1 aggregators are not required to. |
 
 ## 4. Attestation format
 
