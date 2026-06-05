@@ -65,7 +65,7 @@ Agent-to-agent payments need a way to settle escrow **without a human in the loo
 | `contracts/EscrowOracleRegistry.sol` | On-chain attestation aggregator. Adds `attest()` to switchboard's `AgentEscrow.sol`. |
 | `examples/hello-oracle.py` | L0 — single-file Python oracle, ~80 lines. Fetch URL, sign attestation, post. |
 | `oracles/url-check/` | Reference oracle implementing `url_check` end-to-end |
-| `oracles/hash-check/` | Reference oracle for `hash_check` |
+| `oracles/hash-check/` | Reference oracle for `hash_check`: verify fetched IPFS content against the SHA-256 multihash embedded in a CID |
 | `oracles/event-check/` | Reference oracle for on-chain `event_check` |
 | `game/` | The protocol-tuning + adversarial + compose game (see issue #6) |
 
